@@ -203,13 +203,33 @@ Each parcel object contains a `geometry` field holding a **JSON-encoded string**
   }
 ```
 
-Approximately 22% of parcel records have `geometry = "[null, null]"` — these are predominantly **condominium units**. Individual condo units are separate tax accounts but share a single physical parcel polygon with their sibling units. To recover coordinates for these records, the script also extracts `geoID` from `propertyIdentification[0]` and then propagates valid coordinates from any sibling unit that does have geometry:
+Many parcel records have `geometry = "[null, null]"`. These missing records are not simply bad rows: they are often condominium units, apartment-style accounts, multi-parcel ownership records, utility/common-area records, or other tax accounts where TCAD represents the taxable account separately from the physical parcel geometry. In other words, the JSON is closer to an appraisal-account export than a clean one-feature-per-polygon GIS layer.
+
+The standalone script therefore uses a staged coordinate workflow. Each stage only fills records that are still missing coordinates, and the final output includes `coord_source` so approximate fills can be audited or filtered out later:
+
+1. **JSON geometry**: parse top-level `geometry` into `lat` and `lon`.
+2. **JSON `geoID` siblings**: propagate coordinates among JSON records sharing `propertyIdentification[0].geoID`.
+3. **JSON `links.linkedPID`**: use TCAD-linked account relationships when a linked parcel already has coordinates.
+4. **JSON repeated situs address**: when multiple JSON records share the same situs street number, street name, and ZIP, use the median known coordinate for that address.
+5. **Parcel polygon exact ID fallback**: if `data/Parcel_poly.zip` exists, join `coords_df$geoID` to `Parcel_poly$PID_10`, compute a representative point with `st_point_on_surface()`, and fill from that polygon point.
+6. **Address point exact fallback**: if `data/Addresses.zip` exists, join by exact street number, normalized street name, normalized street type, and ZIP. Blank/missing street suffixes are allowed to match each other.
+7. **Unique missing-ZIP address fallback**: for remaining records with street number/name/type but no ZIP, fill only when that address key maps to exactly one address point in `Addresses.zip`.
+8. **Address-point parcel-ID fallback**: use `Addresses.zip` parcel identifiers (`PID` / `PARCEL_ID`) only when they match JSON `geoID` and the address point also agrees with the TCAD situs street number and street name.
+9. **Nearest address point fallback**: for remaining numeric addresses, use nearby address points on the same street, street type, and ZIP within `ADDRESS_NEAREST_MAX_DELTA` house numbers. If the missing address falls between two known points, the script uses the median of those two coordinates; otherwise it uses the nearest point.
+
+The JSON-native stages are preferred because they do not require any external GIS file. The parcel polygon fallback is the next safest option because it uses an identifier match (`geoID` to `PID_10`). Address-point matching is looser, so the script moves from exact address matches to carefully constrained missing-ZIP and parcel-ID matches before using nearest-address interpolation. Nearest-address matching is explicitly approximate, but it is useful for records where the physical location is clear from neighboring address points even though TCAD did not publish a direct geometry for the account.
+
+For example, the `geoID` sibling fill is:
 
 ```r
 geoid_lookup <- coords_df |>
   filter(!is.na(lat), !is.na(lon), !is.na(geoID)) |>
-  distinct(geoID, .keep_all = TRUE) |>
-  select(geoID, lat_fill = lat, lon_fill = lon)
+  group_by(geoID) |>
+  summarise(
+    lat_fill = median(lat),
+    lon_fill = median(lon),
+    .groups = "drop"
+  )
 
 coords_df <- coords_df |>
   left_join(geoid_lookup, by = "geoID") |>
@@ -219,6 +239,47 @@ coords_df <- coords_df |>
   ) |>
   select(-lat_fill, -lon_fill)
 ```
+
+The median is used as a conservative representative point when several records match the same key. In most cases there is only one coordinate, so the median is identical to the source value. When there are several nearby points, the median is less sensitive to an outlier than a mean.
+
+The script writes `output/coords_summary.csv` and `output/missing_coord_diagnostics.csv` during development runs. These files show how many records each stage recovered and why any remaining records could not be matched. Remaining unmatched records usually fall into one of two categories:
+
+- They have no usable `geoID`, so neither JSON sibling matching nor parcel polygon matching can work.
+- They have a `geoID`, but that ID is not present in `Parcel_poly$PID_10`, which suggests the record is an account/unit/common-area representation rather than a standalone polygon feature in the parcel layer.
+
+Because some remaining records are residential and can be corporate-owned, they should not be dismissed as harmless junk by default. They can be excluded from spatial filtering only with the understanding that the mapped result may undercount some condo, multifamily, or account-level records.
+
+### Address aliases and external geocoding audit trail
+
+After the local TCAD/Travis County GIS coordinate recovery stages, a meaningful number of records can still have complete-looking situs addresses but no coordinates. The remaining clusters are not all the same kind of problem. Some are straightforward street-name convention mismatches between TCAD and `Addresses.zip`; others are true missing address-point coverage, missing ZIPs, new subdivision streets, or bad/ambiguous address strings.
+
+To keep this auditable, the standalone workflow uses two additional data artifacts rather than hard-coding one-off fixes in the script:
+
+| File | Purpose |
+|---|---|
+| `data/address_aliases.csv` | Manual, high-confidence street/address aliases used before address matching. Examples include ordinal street expansion (`12 ST` to `12TH ST`), legacy street spelling (`MENCHACA RD` to `MANCHACA RD`), route normalization (`RANCH RD 2222` to `2222 RD`), and selected type splits (`NORTH PLAZA` to `NORTH PLZ`). |
+| `output/missing_coords_geocodable_clusters.csv` | Groups still-missing, structurally geocodable addresses by street name, suffix, and ZIP. This is the main review file for deciding whether additional aliases are safe. |
+| `output/missing_coords_geocodable_addresses.csv` | Row-level still-missing geocodable addresses, used to build external geocoding requests. |
+| `output/geocoding_candidates.csv` | Unique address strings prepared for external geocoding. Multiple parcel records at the same address are collapsed to one query with `n_records`. |
+| `output/geocoding_results_arcgis.csv` | Raw ArcGIS Pro geocoding export. This is not merged directly because it can contain low-quality or out-of-area matches. |
+| `output/geocoding_arcgis_accepted_queries.csv` | Query-level ArcGIS results that passed the acceptance rules. |
+| `output/geocoding_arcgis_review_queries.csv` | Query-level ArcGIS results rejected or held for manual review. This file is useful for spotting errors such as matches in Houston, Dallas, the Northeast, or `(0, 0)` coordinates. |
+| `output/geocoding_arcgis_accepted_lookup.csv` | Parcel-level lookup derived from accepted ArcGIS results. If this file exists, `standalone_corporate_parcels.R` applies it as a final coordinate fill with `coord_source = "arcgis_geocoder"`. |
+
+The alias table is deliberately conservative. It should contain only transformations that are supported by the local address reference and that can be explained row-by-row. Ambiguous subdivision clusters should stay out of the alias table even if they are high-volume, because an alias would hide uncertainty rather than resolve it.
+
+The ArcGIS geocoder results are also filtered conservatively before merging. The accepted lookup currently requires:
+
+- `Status == "M"`
+- `Score >= 95`
+- `Addr_type` is one of `PointAddress`, `Subaddress`, `StreetAddress`, or `StreetAddressExt`
+- `RegionAbbr == "TX"`
+- `Subregion == "Travis County"`
+- Coordinates fall inside a broad Austin/Travis bounding box
+
+This rejects obvious false positives and coarse matches, including records geocoded to other states, other Texas metros, ZIP centroids, locality centroids, or unmatched `(0, 0)` points. In one development run, `output/geocoding_candidates.csv` contained 11,561 unique address queries representing 16,345 parcel rows. The strict ArcGIS acceptance pass kept 10,894 queries and produced `output/geocoding_arcgis_accepted_lookup.csv` with 15,242 parcel-level coordinate fills. After applying that lookup, `output/coords_summary.csv` showed 479,416 of 486,859 coordinate rows filled, with 7,443 still missing.
+
+The important principle is that every coordinate has a provenance. Downstream analysis can keep all coordinates, exclude approximate sources, or inspect particular stages using `coord_source`.
 
 ### Identifying corporate ownership
 
