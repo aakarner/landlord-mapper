@@ -8,8 +8,7 @@
 #
 # Output
 # ------
-# corporate_owned_parcels.csv  – one row per matching parcel, written to the
-#                                 current working directory.
+# output/corporate_owned_parcels.csv – one row per matching parcel.
 #
 # How to run
 # ----------
@@ -69,7 +68,8 @@ if (nchar(Sys.which("jq")) == 0L) {
 options(timeout = 7200)  # allow up to 2 hours for large downloads
 
 zip_path  <- "tcad_special_export.zip"   # where to save / look for the ZIP
-out_path  <- "corporate_owned_parcels.csv"
+out_path  <- "output/corporate_owned_parcels.csv"
+hex_parcel_out_path <- "output/residential_parcels_for_hex.csv"
 PAGE_SIZE <- 10000L   # rows per page passed to stream_in() — tune down if RAM is tight
 
 parcel_poly_zip_path <- "data/Parcel_poly.zip"
@@ -1291,6 +1291,52 @@ corporate_parcels <- parcels |>
   dplyr::rename(parcel_id = situs_pID) |>
   distinct()
 
+first_non_missing <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0L) NA else x[[1]]
+}
+
+residential_parcels_for_hex <- parcels |>
+  dplyr::filter(is_residential) |>
+  dplyr::group_by(situs_pID) |>
+  dplyr::summarise(
+    parcel_id = first_non_missing(situs_pID),
+    situs_address = first_non_missing(situs_address),
+    situs_city = first_non_missing(situs_city),
+    situs_state = first_non_missing(situs_state),
+    situs_zip = first_non_missing(situs_zip),
+    propertyChar_zoning = first_non_missing(propertyChar_zoning),
+    propertyProf_imprvStateCd = first_non_missing(propertyProf_imprvStateCd),
+    propertyProf_landStateCd = first_non_missing(propertyProf_landStateCd),
+    propertyProf_imprvActualYearBuilt = first_non_missing(propertyProf_imprvActualYearBuilt),
+    improvement_sqft = suppressWarnings(as.numeric(first_non_missing(propertyProf_imprvTotalArea))),
+    land_sqft = suppressWarnings(as.numeric(first_non_missing(propertyProf_landTotalSqft))),
+    property_units = suppressWarnings(as.numeric(first_non_missing(property_units))),
+    lat = suppressWarnings(as.numeric(first_non_missing(lat))),
+    lon = suppressWarnings(as.numeric(first_non_missing(lon))),
+    coord_source = first_non_missing(coord_source),
+    is_residential = any(is_residential, na.rm = TRUE),
+    is_owner_occupied = any(is_owner_occupied, na.rm = TRUE),
+    has_financialized_owner = any(is_financialized, na.rm = TRUE),
+    is_corporate_owned = any(is_target, na.rm = TRUE),
+    owner_names = paste(sort(unique(na.omit(owner_name))), collapse = "; "),
+    n_owner_rows = dplyr::n(),
+    parcel_count = 1L,
+    corporate_parcel_count = as.integer(any(is_target, na.rm = TRUE)),
+    corporate_units = ifelse(any(is_target, na.rm = TRUE), property_units, 0),
+    corporate_improvement_sqft = ifelse(
+      any(is_target, na.rm = TRUE),
+      improvement_sqft,
+      0
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    corporate_units = suppressWarnings(as.numeric(corporate_units)),
+    corporate_improvement_sqft = suppressWarnings(as.numeric(corporate_improvement_sqft))
+  ) |>
+  dplyr::select(-situs_pID)
+
 # ── 9b. Filter to parcels within the City of Austin boundary ──────────────
 # Prefer the City of Austin jurisdiction layer when available.  `FULL` is the
 # normal city-limits boundary.  `LTD` is Austin limited-purpose jurisdiction and
@@ -1325,42 +1371,51 @@ if (nrow(austin_boundary) == 0L) {
   )
 }
 
-# Build sf point layer from parcels that have valid coordinates.
-has_coords <- !is.na(corporate_parcels$lat) & !is.na(corporate_parcels$lon)
+filter_to_austin_boundary <- function(df, label) {
+  has_coords <- !is.na(df$lat) & !is.na(df$lon)
 
-if (sum(has_coords) == 0L) {
-  warning(
-    "No parcels have lat/lon coordinates — Austin boundary filter skipped.\n",
-    "  Check that the TCAD JSON export contains top-level 'lat'/'lon' fields."
-  )
-} else {
+  if (sum(has_coords) == 0L) {
+    warning(
+      "No ", label, " rows have lat/lon coordinates; Austin boundary filter ",
+      "returns zero rows."
+    )
+    return(df[0, ])
+  }
+
   message(
     "  ", format(sum(has_coords), big.mark = ","),
-    " of ", format(nrow(corporate_parcels), big.mark = ","),
-    " parcels have coordinates and will be spatially filtered."
+    " of ", format(nrow(df), big.mark = ","),
+    " ", label, " rows have coordinates and will be spatially filtered."
   )
 
-  parcels_sf <- sf::st_as_sf(
-    corporate_parcels[has_coords, ],
+  df_sf <- sf::st_as_sf(
+    df[has_coords, ],
     coords = c("lon", "lat"),
-    crs    = 4326,
-    remove = FALSE   # keep lat/lon columns in the data frame
+    crs = 4326,
+    remove = FALSE
   )
 
-  # Intersect with Austin boundary.
-  in_austin <- lengths(sf::st_intersects(parcels_sf, austin_boundary)) > 0L
+  in_austin <- lengths(sf::st_intersects(df_sf, austin_boundary)) > 0L
 
-  # Replace corporate_parcels with only those inside Austin.
-  n_before <- nrow(corporate_parcels)
-  corporate_parcels <- sf::st_drop_geometry(parcels_sf[in_austin, ])
-  n_after  <- nrow(corporate_parcels)
+  n_before <- nrow(df)
+  out <- sf::st_drop_geometry(df_sf[in_austin, ])
+  n_after <- nrow(out)
   message(
     "  Retained ", format(n_after, big.mark = ","),
-    " parcels inside Austin city limits (",
+    " ", label, " rows inside Austin city limits (",
     format(n_before - n_after, big.mark = ","), " outside / no coords dropped)."
   )
+  out
 }
+
+corporate_parcels <- filter_to_austin_boundary(corporate_parcels, "corporate-owned parcel")
+residential_parcels_for_hex <- filter_to_austin_boundary(
+  residential_parcels_for_hex,
+  "residential parcel universe"
+)
 
 message("Writing ", nrow(corporate_parcels), " rows to: ", out_path)
 readr::write_csv(corporate_parcels, out_path)
-message("Done! Output saved to: ", normalizePath(out_path))
+message("Writing ", nrow(residential_parcels_for_hex), " rows to: ", hex_parcel_out_path)
+readr::write_csv(residential_parcels_for_hex, hex_parcel_out_path)
+message("Done! Outputs saved to: ", normalizePath(out_path), " and ", normalizePath(hex_parcel_out_path))

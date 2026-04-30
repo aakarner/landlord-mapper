@@ -298,4 +298,34 @@ A parcel is flagged as `is_target = TRUE` when it is **residential**, **not owne
 
 The script then spatially filters results to the City of Austin boundary using the Census Bureau's Places layer (via the `tigris` package) and writes the final dataset to `corporate_owned_parcels.csv`.
 
+### Tri-county Austin parcel files for hex aggregation
+
+Austin spans Travis, Williamson, and Hays counties. The Travis workflow in `standalone_corporate_parcels.R` produces the main hex-ready residential parcel universe at `output/residential_parcels_for_hex.csv`. Two county extension scripts add the smaller Austin portions outside Travis:
+
+| Script | Output | Notes |
+|---|---|---|
+| `williamson-parcel-pull.R` | `output/williamson_residential_parcels_for_hex.csv` | Downloads/reuses WCAD Socrata exports, spatially filters WCAD parcel geometry to City of Austin `FULL` jurisdiction, joins WCAD property and owner records, and writes an append-ready parcel file. |
+| `hays-parcel-pull.R` | `output/hays_residential_parcels_for_hex.csv` | Uses Hays CAD property export ZIPs plus the public Hays parcel ArcGIS feature service. The Hays CAD export is nested ZIPs (`PROPERTY`, `OWNER`, `LAND`, `IMPROVEMENT`, `SEGMENT`, etc.), so the script recursively unpacks them before normalizing. |
+
+Both county extension outputs intentionally use the same 25-column schema as `output/residential_parcels_for_hex.csv`, including parcel coordinates, owner-name rollups, residential/corporate flags, parcel/unit/square-foot denominators, and corporate numerator fields. Parcel IDs are prefixed with `WILLIAMSON:` or `HAYS:` to avoid collisions with Travis parcel IDs. Coordinates come from representative points on county parcel geometry and have county-specific `coord_source` values.
+
+In the current development run:
+
+| File | Residential parcels | Corporate-owned parcels | Estimated units | Corporate estimated units |
+|---|---:|---:|---:|---:|
+| `output/williamson_residential_parcels_for_hex.csv` | 13,482 | 782 | 20,587 | 6,811 |
+| `output/hays_residential_parcels_for_hex.csv` | 298 | 1 | 298 | 1 |
+
+These files can be appended directly for citywide hex aggregation:
+
+```r
+travis <- readr::read_csv("output/residential_parcels_for_hex.csv", show_col_types = FALSE)
+williamson <- readr::read_csv("output/williamson_residential_parcels_for_hex.csv", show_col_types = FALSE)
+hays <- readr::read_csv("output/hays_residential_parcels_for_hex.csv", show_col_types = FALSE)
+
+austin_parcels_for_hex <- dplyr::bind_rows(travis, williamson, hays)
+```
+
+Unit estimates are source-dependent. Travis uses TCAD state codes plus square footage, Williamson uses broader WCAD property type and square-footage rules, and Hays uses Hays state codes where available. The resulting `property_units` field is suitable for hex-level rates, but should be described as an estimated unit denominator rather than a directly reported count.
+
 ---
