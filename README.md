@@ -29,6 +29,7 @@ The pipeline answers the question: *who owns residential rental property in Aust
 | `scrape_helper_functions.R` | R | Downloads the TCAD special export from [traviscad.org](https://traviscad.org/publicinformation); scrapes Austin Open Data (code complaints) via headless Chrome + Selenium; queries the Texas Comptroller Franchise Tax API for corporate details. |
 | `supplementary_scrape_helper_functions.R` | R | Downloads Census ACS data (used to build a Social Vulnerability Index), generates per-property owner "fingerprint" strings, computes pairwise cosine string-distance matrices, clusters properties into ownership groups, and geocodes parcel addresses via the Census geocoder. |
 | `final_output_helper_functions.R` | R | Merges the geocoded parcel dataset with the Housing Hardship Index and SVI data to produce the final `owners_info_total` dataset consumed by the Shiny app. |
+| `austin_parcel_land_transactions.R` | R | Standalone tri-county script that produces an all-parcel Austin parcel-year file with current land value, deed/sale counts by year, and corporate-like transaction-party indicators where source records support them. |
 | `HHI Data 2024 United States.xlsx` | Data | Housing Hardship Index scores and ranks for US ZIP codes (2024). |
 | `shinyApp/app.R` | R | Interactive Shiny dashboard for exploring the final dataset: property map (Leaflet), owner table (DT), and landlord network graph (networkD3). |
 
@@ -327,5 +328,60 @@ austin_parcels_for_hex <- dplyr::bind_rows(travis, williamson, hays)
 ```
 
 Unit estimates are source-dependent. Travis uses TCAD state codes plus square footage, Williamson uses broader WCAD property type and square-footage rules, and Hays uses Hays state codes where available. The resulting `property_units` field is suitable for hex-level rates, but should be described as an estimated unit denominator rather than a directly reported count.
+
+---
+
+## Standalone script: `austin_parcel_land_transactions.R`
+
+`austin_parcel_land_transactions.R` creates a citywide parcel-year dataset for displacement modeling. Unlike the corporate-ownership hex files above, this script uses **all parcels** inside the City of Austin `FULL` jurisdiction, including commercial parcels, because nonresidential land transactions may also be relevant to neighborhood change.
+
+Primary output:
+
+```text
+output/austin_parcel_year_land_transactions.csv
+```
+
+The output has one row per `parcel_id` plus `transaction_year`, with current parcel attributes repeated for modeling convenience. Parcel IDs are prefixed by county (`TRAVIS:`, `WILLIAMSON:`, `HAYS:`) to avoid collisions across appraisal districts.
+
+### Sources and county treatment
+
+| County | Land value source | Transaction source | Notes |
+|---|---|---|---|
+| Travis | TCAD `valuations` records from `tcad_special_export.zip` | TCAD `deeds` records from `tcad_special_export.zip` | Streams the large TCAD JSON with `jq`, caches extracted valuation/deed tables in `output/`, and counts deeds by deed year. Buyer and seller names are classified with the same corporate/financialized marker regex used elsewhere. |
+| Williamson | `data/wcad/wcad_property_certified.csv`, field `TotalLandMktValue` | Not available in the current WCAD exports | Spatially filters `data/wcad/wcad_parcels.rds` to Austin `FULL`, then joins property records. Transaction fields are `NA` and `transaction_source = "not_available_in_current_wcad_exports"`. |
+| Hays | Hays property export, field `CurrLandValue` | Nested Hays `SALES` export | Recursively reads the nested Hays ZIP export and counts sales by `DeedDate` where available, otherwise `SaleDate`. `PrevOwnerName` supports a corporate seller/previous-owner signal, but buyer identity is not inferred. |
+
+The script also writes a QA summary:
+
+```text
+output/austin_parcel_year_land_transactions_summary.csv
+```
+
+For quick testing without the long Travis stream, set `AUSTIN_LAND_TX_COUNTIES`:
+
+```bash
+AUSTIN_LAND_TX_COUNTIES=Williamson,Hays Rscript austin_parcel_land_transactions.R
+```
+
+Subset runs write subset-named outputs, such as:
+
+```text
+output/austin_parcel_year_land_transactions_williamson_hays.csv
+output/austin_parcel_year_land_transactions_summary_williamson_hays.csv
+```
+
+### Corporate transaction fields
+
+The transaction fields represent deed or sale records involving corporate-like names, not a definitive annual ownership panel. Travis supports buyer and seller indicators from `buyerLine` and `sellerLine`. Hays supports a seller/previous-owner indicator from `PrevOwnerName`. Williamson transaction fields remain unavailable unless a separate public WCAD sales/deed source is added later.
+
+The standard output schema is:
+
+```text
+county, parcel_id, source_property_id, situs_address, situs_city, situs_state,
+situs_zip, lat, lon, coord_source, current_land_value, land_value_tax_year,
+transaction_year, transaction_count, corporate_buyer_transaction_count,
+corporate_seller_transaction_count, corporate_party_transaction_count,
+transaction_source, land_value_source
+```
 
 ---
