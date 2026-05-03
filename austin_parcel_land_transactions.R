@@ -41,6 +41,7 @@ travis_zip_path <- "tcad_special_export.zip"
 travis_situs_path <- file.path(output_dir, "situses.csv")
 travis_coords_path <- file.path(output_dir, "coords.csv")
 travis_valuations_cache_path <- file.path(output_dir, "travis_valuations.csv")
+travis_owner_values_cache_path <- file.path(output_dir, "travis_owner_values.csv")
 travis_deeds_cache_path <- file.path(output_dir, "travis_deeds.csv")
 travis_selected_fields_path <- file.path(output_dir, "travis_land_transaction_selected_fields.csv")
 
@@ -163,20 +164,11 @@ choose_by_regex <- function(df, pattern) {
   if (length(hit)) hit[[1]] else NA_character_
 }
 
-serialize_list_columns <- function(df) {
+drop_list_columns <- function(df) {
   list_cols <- names(df)[vapply(df, is.list, logical(1))]
-  for (col in list_cols) {
-    df[[col]] <- vapply(
-      df[[col]],
-      function(x) {
-        if (length(x) == 0L || all(is.na(x))) {
-          NA_character_
-        } else {
-          jsonlite::toJSON(x, auto_unbox = TRUE, null = "null")
-        }
-      },
-      character(1)
-    )
+  if (length(list_cols)) {
+    message("  Dropping nested/list column(s) not used by this extract: ", paste(list_cols, collapse = ", "))
+    df <- df |> dplyr::select(-dplyr::all_of(list_cols))
   }
   df
 }
@@ -191,6 +183,28 @@ parse_any_date <- function(x) {
   missing <- is.na(out) & !is.na(x)
   out[missing] <- as.Date(suppressWarnings(ymd_hms(x[missing], quiet = TRUE)))
   out
+}
+
+parse_transaction_date <- function(primary, fallback = NULL) {
+  out <- parse_any_date(primary)
+  fallback_out <- if (is.null(fallback)) rep(as.Date(NA), length(out)) else parse_any_date(fallback)
+  yr <- lubridate::year(out)
+  fallback_yr <- lubridate::year(fallback_out)
+  current_year <- as.integer(format(Sys.Date(), "%Y"))
+  bad_primary <- !is.na(yr) & (yr < 1800L | yr > current_year + 1L)
+  use_fallback <- bad_primary & !is.na(fallback_yr) & fallback_yr >= 1800L & fallback_yr <= current_year + 1L
+  out[use_fallback] <- fallback_out[use_fallback]
+  out[bad_primary & !use_fallback] <- as.Date(NA)
+  out
+}
+
+clean_zip <- function(x) {
+  x <- blank_to_na(x)
+  x <- sub("-.*", "", x)
+  x <- sub("\\..*$", "", x)
+  x <- ifelse(grepl("^[0-9]{5}$", x), x, NA_character_)
+  x[x == "00000"] <- NA_character_
+  x
 }
 
 load_austin_boundary <- function() {
@@ -302,7 +316,67 @@ stream_tcad_section <- function(section, prefix, cache_path) {
     df <- tibble::tibble()
   } else {
     names(df) <- ifelse(names(df) == "pID", paste0(prefix, "_pID"), paste0(prefix, "_", names(df)))
-    df <- serialize_list_columns(df)
+    df <- drop_list_columns(df)
+  }
+  readr::write_csv(df, cache_path)
+  df
+}
+
+stream_tcad_owner_values <- function(cache_path) {
+  if (file.exists(cache_path)) {
+    message("Using cached Travis owner values: ", cache_path)
+    return(readr::read_csv(cache_path, show_col_types = FALSE, col_types = readr::cols(.default = "c")))
+  }
+  if (!file.exists(travis_zip_path)) {
+    stop("Missing TCAD export ZIP: ", travis_zip_path, call. = FALSE)
+  }
+  manifest <- unzip(travis_zip_path, list = TRUE)
+  json_name <- manifest$Name[[1]]
+  jq_filter_1 <- "fromstream(1|truncate_stream(inputs))"
+  jq_filter_2 <- paste(
+    'if has("owners") then',
+    '.pID as $pid | .pYear as $pyear |',
+    '(.owners // [])[]? as $owner |',
+    '($owner.ownerValue // [])[]? |',
+    '{',
+    'pID: $pid,',
+    'pYear: $pyear,',
+    'ownerPct: $owner.ownerPct,',
+    'ownerLandValue: .ownerLandValue,',
+    'ownerLandHSValue: .ownerLandHSValue,',
+    'ownerLandNHSValue: .ownerLandNHSValue,',
+    'ownerSULandMktValue: .ownerSULandMktValue,',
+    'ownerMarketValue: .ownerMarketValue',
+    '}',
+    'else empty end'
+  )
+  cmd <- sprintf(
+    "unzip -p %s %s | jq -cn --stream %s | jq -c %s",
+    shQuote(travis_zip_path),
+    shQuote(json_name),
+    shQuote(jq_filter_1),
+    shQuote(jq_filter_2)
+  )
+
+  message("Streaming Travis ownerValue land fields ...")
+  con <- pipe(cmd, open = "r")
+  on.exit(close(con), add = TRUE)
+  chunks <- list()
+  n_pages <- 0L
+  jsonlite::stream_in(
+    con,
+    handler = function(page) {
+      n_pages <<- n_pages + 1L
+      chunks[[n_pages]] <<- page
+      message("  ownerValue page ", n_pages, " processed")
+    },
+    pagesize = PAGE_SIZE,
+    verbose = FALSE
+  )
+
+  df <- dplyr::bind_rows(chunks)
+  if (nrow(df)) {
+    names(df) <- paste0("owner_value_", names(df))
   }
   readr::write_csv(df, cache_path)
   df
@@ -321,7 +395,7 @@ build_travis <- function() {
   situs <- readr::read_csv(travis_situs_path, show_col_types = FALSE, col_types = readr::cols(.default = "c")) |>
     dplyr::mutate(
       situs_pID = as.character(.data$situs_pID),
-      situs_zip = sub("-.*", "", as.character(.data$situs_zip)),
+      situs_zip = clean_zip(.data$situs_zip),
       situs_city = dplyr::coalesce(blank_to_na(.data$situs_city), "AUSTIN"),
       situs_state = dplyr::coalesce(blank_to_na(.data$situs_state), "TX"),
       situs_address = clean_string(paste(.data$situs_streetNum, .data$situs_streetPrefix, .data$situs_streetName, .data$situs_streetSuffix, .data$situs_city, .data$situs_state, .data$situs_zip))
@@ -350,42 +424,37 @@ build_travis <- function() {
     dplyr::left_join(coords, by = "source_property_id", relationship = "one-to-one") |>
     filter_points_to_austin(label = "Travis parcels")
 
-  valuations <- stream_tcad_section("valuations", "valuation", travis_valuations_cache_path)
-  land_value_col <- choose_first_existing(valuations, c(
-    "valuation_landMarketValue", "valuation_landMktValue", "valuation_landValue",
-    "valuation_land", "valuation_landMarket", "valuation_totalLandMktValue",
-    "valuation_landHS", "valuation_landNHS", "valuation_landNonHS",
-    "valuation_marketLandValue", "valuation_totalLandValue"
-  ))
-  if (is.na(land_value_col)) land_value_col <- choose_by_regex(valuations, "land.*(mkt|market|value)|land.*val")
-  tax_year_col <- choose_first_existing(valuations, c("valuation_year", "valuation_taxYear", "valuation_appraisalYear", "valuation_rollYear"))
-  if (is.na(tax_year_col)) tax_year_col <- choose_by_regex(valuations, "year")
+  owner_values <- stream_tcad_owner_values(travis_owner_values_cache_path)
+  land_value_col <- "owner_value_ownerLandValue"
+  tax_year_col <- "owner_value_pYear"
 
-  if (!is.na(land_value_col) && "valuation_pID" %in% names(valuations)) {
-    land_values <- valuations |>
+  if (land_value_col %in% names(owner_values) && "owner_value_pID" %in% names(owner_values)) {
+    land_values <- owner_values |>
       dplyr::transmute(
-        source_property_id = as.character(.data$valuation_pID),
+        source_property_id = as.character(.data$owner_value_pID),
         current_land_value = suppressWarnings(as.numeric(.data[[land_value_col]])),
         land_value_tax_year = if (!is.na(tax_year_col)) suppressWarnings(as.integer(.data[[tax_year_col]])) else NA_integer_
       ) |>
       dplyr::arrange(.data$source_property_id, dplyr::desc(.data$land_value_tax_year)) |>
       dplyr::group_by(.data$source_property_id) |>
       dplyr::summarise(
-        current_land_value = first_non_missing(.data$current_land_value),
+        current_land_value = suppressWarnings(max(.data$current_land_value, na.rm = TRUE)),
         land_value_tax_year = suppressWarnings(as.integer(first_non_missing(.data$land_value_tax_year))),
         .groups = "drop"
-      )
+      ) |>
+      dplyr::mutate(current_land_value = dplyr::if_else(is.infinite(.data$current_land_value), NA_real_, .data$current_land_value))
     parcel_df <- parcel_df |>
       dplyr::left_join(land_values, by = "source_property_id", relationship = "one-to-one") |>
-      dplyr::mutate(land_value_source = paste0("tcad_valuations.", land_value_col))
+      dplyr::mutate(land_value_source = paste0("tcad_owner_value.", land_value_col))
   } else {
-    warning("Could not identify Travis valuation land-value field; Travis land values will be NA.")
+    warning("Could not identify Travis ownerValue land-value field; Travis land values will be NA.")
     parcel_df <- parcel_df |>
-      dplyr::mutate(current_land_value = NA_real_, land_value_tax_year = NA_integer_, land_value_source = "tcad_valuations_field_not_found")
+      dplyr::mutate(current_land_value = NA_real_, land_value_tax_year = NA_integer_, land_value_source = "tcad_owner_value_field_not_found")
   }
 
   deeds <- stream_tcad_section("deeds", "deed", travis_deeds_cache_path)
   date_col <- choose_first_existing(deeds, c("deed_deedDt", "deed_deedDate", "deed_date", "deed_recordedDate"))
+  recorded_date_col <- choose_first_existing(deeds, c("deed_deedRecordedDt", "deed_recordedDate", "deed_fileDt"))
   buyer_col <- choose_first_existing(deeds, c("deed_buyerLine", "deed_buyerline", "deed_buyer"))
   seller_col <- choose_first_existing(deeds, c("deed_sellerLine", "deed_sellerline", "deed_seller"))
 
@@ -395,6 +464,7 @@ build_travis <- function() {
       valuation_land_value_col = land_value_col,
       valuation_tax_year_col = tax_year_col,
       deed_date_col = date_col,
+      deed_recorded_date_col = recorded_date_col,
       deed_buyer_col = buyer_col,
       deed_seller_col = seller_col
     ),
@@ -404,7 +474,11 @@ build_travis <- function() {
   if (!is.na(date_col) && "deed_pID" %in% names(deeds)) {
     deed_rows <- deeds |>
       dplyr::mutate(
-        transaction_year = lubridate::year(parse_any_date(.data[[date_col]])),
+        transaction_date = parse_transaction_date(
+          .data[[date_col]],
+          if (!is.na(recorded_date_col)) .data[[recorded_date_col]] else NULL
+        ),
+        transaction_year = lubridate::year(.data$transaction_date),
         buyer_is_corporate = if (!is.na(buyer_col)) is_corporate_name(.data[[buyer_col]]) else NA,
         seller_is_corporate = if (!is.na(seller_col)) is_corporate_name(.data[[seller_col]]) else NA
       ) |>
@@ -484,7 +558,7 @@ build_williamson <- function() {
       situs_address = dplyr::coalesce(.data$SitusAddress, .data$Address, .data$PropertyAddress, .data$parcel_siteaddress),
       situs_city = .data$City,
       situs_state = dplyr::coalesce(.data$State, "TX"),
-      situs_zip = sub("-.*", "", .data$Zip),
+      situs_zip = clean_zip(.data$Zip),
       lat = suppressWarnings(as.numeric(.data$lat)),
       lon = suppressWarnings(as.numeric(.data$lon)),
       coord_source = dplyr::if_else(!is.na(.data$lat) & !is.na(.data$lon), "wcad_parcel_point_on_surface", NA_character_),
@@ -600,7 +674,7 @@ build_hays <- function() {
       situs_address = .data$SitusAddress,
       situs_city = .data$SitusCity,
       situs_state = dplyr::coalesce(.data$SitusState, "TX"),
-      situs_zip = sub("-.*", "", .data$SitusZip),
+      situs_zip = clean_zip(.data$SitusZip),
       lat = suppressWarnings(as.numeric(.data$lat)),
       lon = suppressWarnings(as.numeric(.data$lon)),
       coord_source = dplyr::if_else(!is.na(.data$lat) & !is.na(.data$lon), "hays_parcel_point_on_surface", NA_character_),

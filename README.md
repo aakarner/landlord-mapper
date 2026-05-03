@@ -347,7 +347,7 @@ The output has one row per `parcel_id` plus `transaction_year`, with current par
 
 | County | Land value source | Transaction source | Notes |
 |---|---|---|---|
-| Travis | TCAD `valuations` records from `tcad_special_export.zip` | TCAD `deeds` records from `tcad_special_export.zip` | Streams the large TCAD JSON with `jq`, caches extracted valuation/deed tables in `output/`, and counts deeds by deed year. Buyer and seller names are classified with the same corporate/financialized marker regex used elsewhere. |
+| Travis | TCAD `owners[].ownerValue[]`, field `ownerLandValue`, from `tcad_special_export.zip` | TCAD `deeds` records from `tcad_special_export.zip` | Streams the large TCAD JSON with `jq`, caches extracted owner-value/deed tables in `output/`, and counts deeds by deed year. Buyer and seller names are classified with the same corporate/financialized marker regex used elsewhere. |
 | Williamson | `data/wcad/wcad_property_certified.csv`, field `TotalLandMktValue` | Not available in the current WCAD exports | Spatially filters `data/wcad/wcad_parcels.rds` to Austin `FULL`, then joins property records. Transaction fields are `NA` and `transaction_source = "not_available_in_current_wcad_exports"`. |
 | Hays | Hays property export, field `CurrLandValue` | Nested Hays `SALES` export | Recursively reads the nested Hays ZIP export and counts sales by `DeedDate` where available, otherwise `SaleDate`. `PrevOwnerName` supports a corporate seller/previous-owner signal, but buyer identity is not inferred. |
 
@@ -356,6 +356,16 @@ The script also writes a QA summary:
 ```text
 output/austin_parcel_year_land_transactions_summary.csv
 ```
+
+Travis extraction uses cached flat files after the first successful run:
+
+```text
+output/travis_owner_values.csv
+output/travis_deeds.csv
+output/travis_land_transaction_selected_fields.csv
+```
+
+The script normalizes ZIP codes to valid five-digit strings, treats `00000` as missing, and handles malformed TCAD deed dates by falling back to recorded deed dates when available. This avoids spurious transaction years such as `21`, `201`, or `222` from malformed source dates.
 
 For quick testing without the long Travis stream, set `AUSTIN_LAND_TX_COUNTIES`:
 
