@@ -1118,7 +1118,15 @@ owners_df$owner_address <- clean_address(
         owners_df$owner_addrZip)
 )
 
-# Normalise owner name (remove punctuation / extra spaces)
+# Normalise owner name (remove punctuation / extra spaces). Preserve LLC as a
+# separate token in series names like LLC-SERIES before punctuation is removed.
+owners_df$owner_name <- gsub(
+  "\\b(L\\.?L\\.?C\\.?)\\s*[-/]",
+  "\\1 ",
+  as.character(owners_df$owner_name),
+  ignore.case = TRUE,
+  perl = TRUE
+)
 owners_df$owner_name <- gsub(
   "[[:punct:]]", "",
   gsub("[[:space:]]{2,}", " ", as.character(owners_df$owner_name))
@@ -1211,6 +1219,7 @@ financial_markers <- paste(
   # Formal entity type markers — require word boundaries to avoid false matches
   "\\bLTD\\b", "\\bL T D\\b", "\\bL\\.?T\\.?D\\.?\\b",
   "\\bLLC\\b", "\\bL L C\\b", "\\bL\\.?L\\.?C\\.?\\b",
+  "\\bLLP\\b", "\\bL L P\\b", "\\bL\\.?L\\.?P\\.?\\b",
   "\\bLP\\b",  "\\bL P\\b",   "\\bL\\.?P\\.?\\b",
   "\\bLLLP\\b","\\bL L L P\\b","\\bL\\.?L\\.?L\\.?P\\.?\\b",
   "\\bINC\\b", "\\bI N C\\b", "\\bI\\.?N\\.?C\\.?\\b",
