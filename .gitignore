@@ -195,6 +195,10 @@ cython_debug/
 *.csv
 *.zip
 
+# Historical-ownership source archives, address-bearing intermediates, and outputs
+data/historical_ownership/
+output/historical_ownership/
+
 # Checks
 /*.Rcheck/
 
